@@ -1,0 +1,119 @@
+name: Release Firefox extension
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and package
+    if: >-
+      (github.event_name == 'push' && !github.event.deleted) ||
+      (github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' &&
+       github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check version
+        id: version
+        run: |
+          version=$(jq -er '.version' extension/manifest.json)
+          [[ "$version" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]]
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "::error::Tag must match extension/manifest.json ($tag)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test archives and one-tap export
+        run: |
+          node --test tests/archive.test.cjs
+          npm install --prefix "$RUNNER_TEMP/export-test" --no-save --ignore-scripts linkedom@0.18.12
+          python3 tests/integration.py --dom-module "$RUNNER_TEMP/export-test/node_modules/linkedom/worker.js"
+      - name: Build and verify XPI
+        run: |
+          python3 build.py
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          source = Path("extension")
+          with ZipFile("dist/export-zip-unsigned.xpi") as archive:
+              expected = {p.relative_to(source).as_posix() for p in source.rglob("*") if p.is_file()}
+              assert sorted(archive.namelist()) == sorted(expected)
+              for name in expected:
+                  assert archive.read(name) == (source / name).read_bytes(), name
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-xpi
+          path: dist/export-zip-unsigned.xpi
+          if-no-files-found: error
+          overwrite: true
+
+  release:
+    name: Publish release
+    if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.build.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      COMMIT: ${{ needs.build.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-xpi
+          path: dist
+      - name: Verify tag target
+        run: |
+          ref="refs/tags/$TAG"
+          remote=$(git ls-remote --refs origin "$ref")
+          if [[ -z "$remote" && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            git push origin "$COMMIT:$ref"
+          fi
+          git fetch --no-tags origin "$ref"
+          if [[ "$(git rev-parse 'FETCH_HEAD^{commit}')" != "$COMMIT" ]]; then
+            echo "::error::$TAG points to a different commit"
+            exit 1
+          fi
+      - name: Publish the verified XPI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=export-zip-unsigned.xpi
+          file="dist/$asset"
+          if ! release=$(gh release view "$TAG" --json assets,isDraft); then
+            gh release create "$TAG" "$file" --verify-tag --title "Export ZIP $TAG" --notes "Unsigned Firefox extension package."
+          else
+            if jq -e --arg name "$asset" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
+              gh release download "$TAG" --pattern "$asset" --dir "$RUNNER_TEMP/existing-release"
+              cmp "$file" "$RUNNER_TEMP/existing-release/$asset"
+            else
+              gh release upload "$TAG" "$file"
+            fi
+            if jq -e '.isDraft' <<< "$release" >/dev/null; then
+              gh release edit "$TAG" --draft=false
+            fi
+          fi

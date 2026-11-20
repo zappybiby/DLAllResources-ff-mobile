@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font: 1rem/1.5 Roboto, system-ui, sans-serif; color: #193431; background: #f5f8f6; }
+body { margin: 0; }
+main { max-width: 34rem; margin: clamp(2rem, 12vh, 7rem) auto; padding: 0 1.5rem; }
+h1 { font-size: clamp(1.75rem, 5vw, 2.3rem); letter-spacing: -.035em; line-height: 1.15; margin-bottom: .45rem; }
+p { margin: .45rem 0; overflow-wrap: anywhere; }
+#title { font-size: 1.1rem; }
+#status { color: #49635e; }
+progress { width: 100%; margin-top: 1.25rem; accent-color: #247763; }
+a { display: inline-block; border-radius: .45rem; background: #24584c; color: white; padding: .7rem 1rem; margin-top: 1.2rem; font-weight: 600; text-decoration: none; }
+[hidden] { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root { color: #e0eee7; background: #142320; }
+  #status { color: #adc2ba; }
+  a { background: #a4e1c8; color: #13392d; }
+}

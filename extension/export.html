@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Export ZIP</title>
+  <link rel="icon" href="icon.svg">
+  <link rel="stylesheet" href="export.css">
+  <script defer src="vendor/acorn.js"></script>
+  <script defer src="archive.js"></script>
+  <script defer src="deps.js"></script>
+  <script defer src="offline.js"></script>
+  <script defer src="read.js"></script>
+  <script defer src="exporter.js"></script>
+  <script defer src="ui.js"></script>
+</head>
+<body>
+  <main>
+    <img src="icon.svg" alt="" width="48" height="48">
+    <h1 id="heading">Exporting page…</h1>
+    <p id="title"></p>
+    <div role="status" aria-live="polite"><p id="status">Reading the open tab…</p></div>
+    <progress aria-label="Collected resources"></progress>
+    <a id="download" hidden>Download ZIP again</a>
+  </main>
+</body>
+</html>
