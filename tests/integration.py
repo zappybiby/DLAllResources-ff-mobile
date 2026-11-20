@@ -19,14 +19,43 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.parse import unquote, urlsplit
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
+from zlib import crc32
+
+# Three spellings serve the same SVG. A different value at that exact path changes the image.
+BADGE = "/app/media/badge.svg"
+VARIANTS = {
+    "plain": BADGE,
+    "build": BADGE + "?build=2026",
+    "arbitrary": BADGE + "?unrelated_name=q7&stamp=z",
+    "different": BADGE + "?build=red",
+    "other-path": "/app/icons/badge.svg?build=2026",
+}
+# Different image colors with equal lengths and colliding ZIP checksums.
+BADGE_SVG = '<svg xmlns="http://www.w3.org/2000/svg"><rect fill="{}"/><!--{}--></svg>'
+BLUE = BADGE_SVG.format("blue", "64758b1a14ce081e")
+GREEN = BADGE_SVG.format("lime", "bee9219b394191fc")
+IMAGE_MARKUP = "".join(f'<img id="{key}" src="{url}">' for key, url in VARIANTS.items())
+IMAGE_CSS = "".join(f'--{key}: url("{url}");' for key, url in VARIANTS.items())
+
+PANEL_CSS = ":root { --panel: url('../media/badge.svg?build=2026') }"
+REMOTE_CSS = ":root { --texture: url('./texture.svg') }"
+SHEETS = {
+    "panel-one": "/app/styles/panel.css?cb=first",
+    "panel-two": "/app/styles/panel.css?anything=second",
+    "skin-a": "/app/styles/skin.css?revision=left",
+    "skin-b": "/app/styles/skin.css?north=south",
+}
+REDIRECTS = {SHEETS["skin-a"]: "/app/left/skin.css", SHEETS["skin-b"]: "/app/right/skin.css"}
+REDIRECT_TARGETS = {target: source for source, target in REDIRECTS.items()}
+LINK_MARKUP = "".join(f'<link rel="stylesheet" id="{key}" href="{url}">' for key, url in SHEETS.items())
 
 EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 ORIGINAL = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Order review</title>
-<base href="/app/"><link rel="stylesheet" href="styles/main.css">
+<base href="/app/"><link rel="stylesheet" href="styles/main.css">SHEETS
 <script type="module" src="entry.js"></script></head>
-<body><button id="orders">Open table</button><main></main></body></html>"""
+<body><button id="orders">Open table</button><main></main>IMAGES</body></html>""".replace("IMAGES", IMAGE_MARKUP).replace("SHEETS", LINK_MARKUP)
 PRELOADS = ["table.js", "editor.js", *[f"chunk-{i:02}.js" for i in range(25)]]
 ENTRY = """
 document.querySelector('#orders').onclick = async () => {
@@ -37,6 +66,12 @@ document.querySelector('#orders').onclick = async () => {
     link.href = 'chunks/' + name;
     document.head.append(link);
   }
+  const remote = document.createElement('img');
+  const remoteURL = new URL('/app/media/badge.svg?build=2026', location.href);
+  remoteURL.hostname = 'localhost';
+  remote.id = 'other-host';
+  remote.src = remoteURL.href;
+  document.body.append(remote);
   const {show} = await import('./chunks/table.js');
   show();
 };
@@ -60,7 +95,7 @@ FIXTURES = {
     "/orders": ("text/html", ORIGINAL),
     "/runner": ("text/html", "<!doctype html><title>Test</title>"),
     "/app/entry.js": ("text/javascript", ENTRY),
-    "/app/chunks/table.js": ("text/javascript", TABLE),
+    "/app/chunks/table.js": ("text/javascript", TABLE + "/* table metadata */\n" * 1000),
     "/app/chunks/editor.js": ("text/javascript", EDITOR),
     "/app/later/data.js": ("text/javascript", "export { default } from './labels.js';"),
     "/app/later/labels.js": ("text/javascript", 'export default "Later";'),
@@ -68,10 +103,16 @@ FIXTURES = {
     "/app/styles/theme/colors.css": (
         "text/css",
         'table { color: rgb(1, 70, 130); background: url("../../media/grid.svg") }'
-        ' body { cursor: url("../../unavailable.cur"), auto }',
+        ' body { cursor: url("../../unavailable.cur"), auto } :root {' + IMAGE_CSS + "}",
     ),
     "/app/media/grid.svg": ("image/svg+xml", '<svg xmlns="http://www.w3.org/2000/svg"/>'),
 }
+for key, url in VARIANTS.items():
+    FIXTURES[url] = ("image/svg+xml", GREEN if key == "different" else BLUE)
+for key, url in SHEETS.items():
+    FIXTURES[url] = ("text/css", PANEL_CSS if key.startswith("panel-") else REMOTE_CSS)
+FIXTURES["/app/left/texture.svg"] = ("image/svg+xml", BLUE.replace("blue", "aqua"))
+FIXTURES["/app/right/texture.svg"] = ("image/svg+xml", BLUE.replace("blue", "gray"))
 for name in PRELOADS[2:]:
     FIXTURES["/app/chunks/" + name] = ("text/javascript", f'export default "{name}";')
 
@@ -83,14 +124,21 @@ class Fixture(BaseHTTPRequestHandler):
         if path == "/app/later/labels.js" and "fixture-session=active" not in self.headers.get("Cookie", ""):
             self.send_error(403)
             return
-        if path not in FIXTURES:
+        if self.path in REDIRECTS:
+            self.send_response(302)
+            self.send_header("Location", REDIRECTS[self.path])
+            self.end_headers()
+            return
+        resource = REDIRECT_TARGETS.get(self.path, self.path)
+        if resource not in FIXTURES:
             self.send_error(404)
             return
-        content_type, content = FIXTURES[path]
+        content_type, content = FIXTURES[resource]
         data = content.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         if path == "/orders":
             self.send_header("Set-Cookie", "fixture-session=active; Path=/; HttpOnly; SameSite=Lax")
         self.end_headers()
@@ -147,6 +195,61 @@ def export(browser, base):
     return base64.b64decode(payload)
 
 
+class Preview(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.elements = []
+
+    def handle_starttag(self, tag, attrs):
+        self.elements.append((tag, dict(attrs)))
+
+
+def check_variants(archive, by_url, base, directory):
+    urls = {key: base + path for key, path in VARIANTS.items()}
+    urls["other-host"] = base.replace("127.0.0.1", "localhost") + VARIANTS["build"]
+    paths = {key: by_url[url]["path"] for key, url in urls.items()}
+    assert paths["plain"] == paths["build"] == paths["arbitrary"], paths
+    assert len({paths[k] for k in ("plain", "different", "other-path", "other-host")}) == 4, paths
+    assert len(BLUE) == len(GREEN) and crc32(BLUE.encode()) == crc32(GREEN.encode())
+    blue_members = [name for name in archive.namelist() if name.endswith(".svg") and archive.read(name) == BLUE.encode()]
+    assert set(blue_members) == {paths["plain"], paths["other-path"], paths["other-host"]}, blue_members
+
+    preview = Preview()
+    preview.feed(archive.read("rendered.html").decode())
+    images = {attrs["id"]: unquote(attrs["src"]) for tag, attrs in preview.elements
+              if tag == "img" and attrs.get("id") in urls}
+    assert images.keys() == urls.keys(), images
+    for key, path in paths.items():
+        assert (directory / images[key]).resolve() == (directory / path).resolve(), (key, images[key], path)
+    sheet = directory / by_url[base + "/app/styles/theme/colors.css"]["viewPath"]
+    css = sheet.read_text()
+    for key in VARIANTS:
+        link = re.search(r"""--""" + key + r""":\s*url\(\s*["']?([^)'"]+)""", css)
+        assert link, (key, css)
+        assert (sheet.parent / unquote(link.group(1))).resolve() == (directory / paths[key]).resolve(), key
+
+    sheets = {key: by_url[base + path] for key, path in SHEETS.items()}
+    first, second = sheets["panel-one"], sheets["panel-two"]
+    assert first["path"] == second["path"] and Path(first["path"]).name == "panel.css", sheets
+    assert first["viewPath"] == second["viewPath"], sheets
+    links = {attrs["id"]: unquote(attrs["href"]) for tag, attrs in preview.elements
+             if tag == "link" and attrs.get("id") in sheets}
+    assert links == {key: row["viewPath"] for key, row in sheets.items()}, links
+
+    # These aliases return the same stylesheet bytes after redirects to two different bases.
+    # The corresponding local view must use the texture from the correct final directory.
+    assert sheets["skin-a"]["path"] == sheets["skin-b"]["path"], sheets
+    for key, side in (("skin-a", "left"), ("skin-b", "right")):
+        view = directory / links[key]
+        texture = re.search(r"""url\(\s*["']?([^)'"]+)""", view.read_text())
+        assert texture, key
+        saved = view.parent / unquote(texture.group(1))
+        assert saved.read_bytes() == FIXTURES[f"/app/{side}/texture.svg"][1].encode(), key
+
+    script = archive.getinfo(by_url[base + "/app/chunks/table.js"]["path"])
+    assert script.compress_type == ZIP_DEFLATED and script.compress_size < script.file_size, script
+
+
 def inspect_zip(browser, payload, base):
     with ZipFile(io.BytesIO(payload)) as archive, tempfile.TemporaryDirectory() as tmp:
         assert archive.testzip() is None
@@ -165,17 +268,9 @@ def inspect_zip(browser, payload, base):
         missing = by_url.get(base + "/app/unavailable.cur")
         assert missing and missing["status"] == "missing" and missing["reason"], missing
         archive.extractall(tmp)
+        check_variants(archive, by_url, base, Path(tmp))
 
         if browser is None:
-            # HTMLParser handles the void elements and boolean attributes in serialized HTML.
-            class Preview(HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self.elements = []
-
-                def handle_starttag(self, tag, attrs):
-                    self.elements.append((tag, dict(attrs)))
-
             preview = Preview()
             html = archive.read("rendered.html").decode()
             preview.feed(html)
@@ -248,7 +343,7 @@ def main():
         server.server_close()
         thread.join()
     print("PASS: 27 modulepreloads, recursive JS/CSS, original bytes, missing resource, "
-          "no API replay, and offline form/dialog/styles")
+          "query deduplication, DEFLATE, and offline form/dialog/styles")
 
 
 if __name__ == "__main__":

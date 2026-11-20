@@ -40,21 +40,39 @@ test("custom ZIP entries reject conflicting and unsafe names", () => {
   assert.throws(() => zip.add("inside/PAGE.HTML", "x"));
 });
 
-test("Python zipfile reads UTF-8 filenames, binary payloads, empty files and CRCs", async () => {
+test("Python zipfile validates mixed DEFLATE and stored entries, offsets and CRCs", async () => {
   const zip = new Zip();
-  zip.add("sites/été.html", "été");
+  zip.add("sites/été.html", "été".repeat(10000));
   const binary = Uint8Array.from([0, 127, 128, 255]);
   zip.add("bytes.bin", binary);
   binary.fill(0);
   zip.add("empty", "");
+  zip.add("css/é.css", ".table { color: red; }".repeat(10000));
+  const first = zip.blob();
+  zip.add("later", "only in the second snapshot");
+  const second = zip.blob();
   const script = [
-    "import io, zipfile, sys",
-    "z=zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()))",
+    "import io, struct, zipfile, sys",
+    "raw=sys.stdin.buffer.read()",
+    "z=zipfile.ZipFile(io.BytesIO(raw))",
+    "assert ('later' in z.namelist()) == (sys.argv[1] == 'second')",
+    "for info in z.infolist():",
+    "    offset=info.header_offset",
+    "    assert raw[offset:offset+4] == b'PK\\x03\\x04'",
+    "    assert struct.unpack_from('<H', raw, offset+8)[0] == info.compress_type",
+    "    assert struct.unpack_from('<III', raw, offset+14) == (info.CRC, info.compress_size, info.file_size)",
     "assert z.testzip() is None",
-    "assert z.read('sites/été.html').decode() == 'été'",
+    "assert z.read('sites/été.html').decode() == 'été'*10000",
+    "assert z.read('css/é.css').decode() == '.table { color: red; }'*10000",
+    "for name in ['sites/été.html', 'css/é.css']:",
+    "    info=z.getinfo(name)",
+    "    assert info.compress_type == zipfile.ZIP_DEFLATED and info.compress_size < info.file_size//10",
+    "assert z.getinfo('empty').compress_type == z.getinfo('bytes.bin').compress_type == zipfile.ZIP_STORED",
     "assert z.read('bytes.bin') == bytes([0,127,128,255])",
     "assert z.read('empty') == b''",
   ].join("\n");
-  const result = spawnSync("python3", ["-c", script], { input: Buffer.from(await zip.blob().arrayBuffer()) });
-  assert.equal(result.status, 0, result.stderr.toString());
+  for (const [name, blob] of [["first", await first], ["second", await second]]) {
+    const result = spawnSync("python3", ["-c", script, name], { input: Buffer.from(await blob.arrayBuffer()) });
+    assert.equal(result.status, 0, result.stderr.toString());
+  }
 });

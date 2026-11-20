@@ -64,7 +64,7 @@ try {
   // Emulate Firefox's messaging APIs with separate globals for each extension context.
   // All script results and messages cross a structured-clone boundary.
   const makeContext = extra => vm.createContext({
-    crypto, URL, TextEncoder, TextDecoder, Blob, AbortController, setTimeout, clearTimeout,
+    crypto, URL, TextEncoder, TextDecoder, Blob, Response, CompressionStream, AbortController, setTimeout, clearTimeout,
     Uint8Array, DOMParser, XMLSerializer, console, ...extra
   });
   const listeners = {};

@@ -44,15 +44,13 @@ globalThis.Archive = (() => {
       this.entries = [];
       this.files = new Set();
       this.directories = new Set();
-      this.offset = 0;
-      this.centralSize = 0;
       const now = new Date();
       this.date = ((Math.min(2107, Math.max(1980, now.getFullYear())) - 1980) << 9) |
         ((now.getMonth() + 1) << 5) | now.getDate();
       this.time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >>> 1);
     }
 
-    add(path, contents) {
+    add(path, contents, checksum) {
       assertPath(path);
       const key = path.split("/").map(portableKey).join("/");
       const parents = [];
@@ -70,20 +68,29 @@ globalThis.Archive = (() => {
       } else if (contents instanceof ArrayBuffer) bytes = new Uint8Array(contents);
       else throw new TypeError("Expected text or bytes for " + path);
 
-      const localSize = 30 + name.length + bytes.byteLength;
-      const centralSize = 46 + name.length;
-      if (this.entries.length >= 65534 || name.length > 65535 ||
-          this.offset + localSize + this.centralSize + centralSize + 22 >= 0xffffffff) {
+      if (this.entries.length >= 65534 || name.length > 65535 || bytes.byteLength >= 0xffffffff) {
         throw new Error("Export exceeds classic ZIP size limits");
       }
-      this.entries.push({ name, data: new Blob([bytes]), crc: crc32(bytes), offset: this.offset });
-      this.offset += localSize;
-      this.centralSize += centralSize;
+      this.entries.push({
+        name, data: new Blob([bytes]), size: bytes.byteLength, crc: checksum ?? crc32(bytes),
+        method: bytes.byteLength ? undefined : 0
+      });
       this.files.add(key);
       for (const parent of parents) this.directories.add(parent);
     }
 
-    header(entry, central) {
+    async compress(entry) {
+      const stream = entry.data.stream().pipeThrough(new CompressionStream("deflate-raw"));
+      const compressed = await new Response(stream).blob();
+      if (compressed.size < entry.size) {
+        entry.data = compressed;
+        entry.method = 8; // ZIP method 8 is raw DEFLATE, without a zlib wrapper.
+      } else {
+        entry.method = 0;
+      }
+    }
+
+    header(entry, central, offset) {
       const start = central ? 46 : 30;
       const bytes = new Uint8Array(start + entry.name.length);
       const view = new DataView(bytes.buffer);
@@ -91,30 +98,51 @@ globalThis.Archive = (() => {
       view.setUint32(0, central ? 0x02014b50 : 0x04034b50, true);
       if (central) {
         view.setUint16(4, 20, true);
-        view.setUint32(42, entry.offset, true);
+        view.setUint32(42, offset, true);
       }
       view.setUint16(4 + delta, 20, true);
       view.setUint16(6 + delta, 0x800, true); // UTF-8 filenames.
+      view.setUint16(8 + delta, entry.method, true);
       view.setUint16(10 + delta, this.time, true);
       view.setUint16(12 + delta, this.date, true);
       view.setUint32(14 + delta, entry.crc, true);
       view.setUint32(18 + delta, entry.data.size, true);
-      view.setUint32(22 + delta, entry.data.size, true);
+      view.setUint32(22 + delta, entry.size, true);
       view.setUint16(26 + delta, entry.name.length, true);
       bytes.set(entry.name, start);
       return bytes;
     }
 
-    blob() {
+    async blob() {
+      const entries = this.entries.slice();
       const parts = [];
-      for (const entry of this.entries) parts.push(this.header(entry, false), entry.data);
-      for (const entry of this.entries) parts.push(this.header(entry, true));
+      const directory = [];
+      let offset = 0;
+      let centralSize = 0;
+      for (const entry of entries) {
+        // Process one member at a time on mobile and share work between simultaneous exports.
+        if (entry.method === undefined) {
+          entry.packing ??= this.compress(entry);
+          try { await entry.packing; }
+          finally { delete entry.packing; }
+        }
+        const local = this.header(entry, false, offset);
+        const central = this.header(entry, true, offset);
+        parts.push(local, entry.data);
+        directory.push(central);
+        offset += local.length + entry.data.size;
+        centralSize += central.length;
+        if (offset + centralSize + 22 >= 0xffffffff) {
+          throw new Error("Export exceeds classic ZIP size limits");
+        }
+      }
+      for (const central of directory) parts.push(central);
       const end = new DataView(new ArrayBuffer(22));
       end.setUint32(0, 0x06054b50, true);
-      end.setUint16(8, this.entries.length, true);
-      end.setUint16(10, this.entries.length, true);
-      end.setUint32(12, this.centralSize, true);
-      end.setUint32(16, this.offset, true);
+      end.setUint16(8, entries.length, true);
+      end.setUint16(10, entries.length, true);
+      end.setUint32(12, centralSize, true);
+      end.setUint32(16, offset, true);
       parts.push(end.buffer);
       return new Blob(parts, { type: "application/zip" });
     }
@@ -180,7 +208,7 @@ globalThis.Archive = (() => {
   class Paths {
     constructor() { this.root = node(); }
 
-    forURL(value, mime = "") {
+    forURL(value, mime = "", keepFilename = false) {
       const url = new URL(value);
       url.hash = "";
       const ext = extensions[(mime || "").toLowerCase().split(";")[0].trim()] || "bin";
@@ -199,12 +227,12 @@ globalThis.Archive = (() => {
         parent = allocate(parent, "directory:" + segment, decodeSegment(segment));
         path.push(parent.name);
       }
-      const suffix = url.search ? "~" + hash(url.search) : "";
+      const suffix = url.search && !keepFilename ? "~" + hash(url.search) : "";
       const file = allocate(parent, "file:" + url.href, decodeSegment(leaf), suffix);
       path.push(file.name);
       return path.join("/");
     }
   }
 
-  return { Zip, Paths };
+  return { Zip, Paths, crc32 };
 })();

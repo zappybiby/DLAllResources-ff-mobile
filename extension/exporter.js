@@ -42,9 +42,55 @@ globalThis.Exporter = (() => {
     return '../'.repeat(from.length - n) + to.slice(n).map(encodeURIComponent).join('/');
   }
 
+  function sameBytes(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  // Keep one buffer per distinct body while the rest of the page is being fetched.
+  function indexAsset(groups, address, bytes) {
+    const url = new URL(address);
+    const location = url.protocol === 'http:' || url.protocol === 'https:' ? url.host + url.pathname : url.href;
+    if (!groups.has(location)) groups.set(location, new Map());
+    const variants = groups.get(location);
+    const crc = Archive.crc32(bytes);
+    const key = bytes.length + '/' + crc;
+    const candidates = variants.get(key) || [];
+    // A matching checksum is only a filter, including for same-length responses.
+    const existing = candidates.find(file => sameBytes(file.bytes, bytes));
+    if (existing) return existing;
+    const file = {location, bytes, crc};
+    candidates.push(file);
+    variants.set(key, candidates);
+    return file;
+  }
+
+  function writeAssets(zip, resources, files, documentRow) {
+    const paths = new Archive.Paths();
+    const named = new Set();
+    const priority = row => row === documentRow ? 0 : row.url.includes('?') ? 2 : 1;
+    // Prefer the URL without a query for the original filename. Ties follow discovery
+    // order instead of whichever response happens to finish first.
+    const saved = resources.filter(row => files.has(row)).sort((a, b) => priority(a) - priority(b));
+    for (const row of saved) {
+      const file = files.get(row);
+      if (!file.path) {
+        file.path = row === documentRow ? 'original.html' : paths.forURL(row.url, row.mime, !named.has(file.location));
+        zip.add(file.path, file.bytes, file.crc);
+        file.bytes = null;
+        named.add(file.location);
+      }
+      row.path = file.path;
+    }
+  }
+
   async function build(snapshot, {read = defaultRead, progress = () => {}} = {}) {
     const zip = new Archive.Zip();
-    const paths = new Archive.Paths();
+    const files = new Map();
+    const contentGroups = new Map();
     const records = new Map();
     const queue = [];
     const styles = [];
@@ -123,17 +169,15 @@ globalThis.Exporter = (() => {
           if (/^<(?:!doctype\s+html|html\b|head\b|body\b)/i.test(start)) throw new Error('Received HTML instead of ' + kind.toUpperCase());
         }
         if (savedBytes + bytes.byteLength > maxAssetBytes) throw new Error('256 MiB asset budget reached');
-        const path = original ? 'original.html' : paths.forURL(row.url, mime);
-        zip.add(path, bytes);
+        files.set(row, indexAsset(contentGroups, row.url, bytes));
         savedBytes += bytes.byteLength;
-        Object.assign(row, {status: 'saved', path, kind, bytes: bytes.byteLength, mime, finalURL, retrieval});
+        Object.assign(row, {status: 'saved', kind, bytes: bytes.byteLength, mime, finalURL, retrieval});
 
         if (kind === 'html') {
           scanDocument(decode(bytes, mime, snapshot.charset), finalURL, original);
         } else if (kind === 'js' || kind === 'css') {
           const text = decode(bytes, mime);
           if (kind === 'css') {
-            row.viewPath = 'view/' + path + '/style.css';
             styles.push({row, text});
           }
           scan(text, kind, finalURL);
@@ -165,21 +209,43 @@ globalThis.Exporter = (() => {
       i += batch.length;
       await Promise.all(batch.map(collect));
     }
+    const resources = [...records.values()];
+    contentGroups.clear();
+    writeAssets(zip, resources, files, documentRow);
+
+    // Identical stylesheets can redirect to different directories. Their raw bytes share
+    // one file, but each offline view must resolve relative links against its own base.
+    const views = new Map();
+    for (const {row, text} of styles) {
+      const base = new URL(row.finalURL);
+      base.search = '';
+      base.hash = '';
+      const candidates = views.get(row.path) || [];
+      let view = candidates.find(item => item.base === base.href && item.text === text);
+      if (!view) {
+        const name = candidates.length ? 'style-' + (candidates.length + 1) + '.css' : 'style.css';
+        view = {path: 'view/' + row.path + '/' + name, base: base.href, text};
+        candidates.push(view);
+        views.set(row.path, candidates);
+      }
+      row.viewPath = view.path;
+    }
     const lookup = url => {
       const row = records.get(url);
       return row?.status === 'saved' ? row.viewPath || row.path : null;
     };
-    for (const {row, text} of styles) {
-      const css = Deps.rewriteCSS(text, row.finalURL, url => {
-        const path = lookup(url);
-        return path ? relativeURL(row.viewPath, path) : null;
-      });
-      zip.add(row.viewPath, css.replace(/^@charset "[^"]+";/i, '@charset "UTF-8";'));
+    for (const candidates of views.values()) {
+      for (const view of candidates) {
+        const css = Deps.rewriteCSS(view.text, view.base, url => {
+          const path = lookup(url);
+          return path ? relativeURL(view.path, path) : null;
+        });
+        zip.add(view.path, css.replace(/^@charset "[^"]+";/i, '@charset "UTF-8";'));
+      }
     }
 
     zip.add('rendered-source.html', snapshot.html);
     zip.add('rendered.html', Offline.render(snapshot, lookup));
-    const resources = [...records.values()];
     const missing = resources.filter(row => row.status === 'missing');
     const report = {
       page: snapshot.url, documentUrl, title: snapshot.title, capturedAt,
@@ -192,7 +258,7 @@ globalThis.Exporter = (() => {
       ...missing.map(row => row.url + ' — ' + row.reason),
       ...report.issues.map(item => item.url + ' — ' + item.reason)
     ].join('\n') || 'All discovered resources saved.\n');
-    return {blob: zip.blob(), report};
+    return {blob: await zip.blob(), report};
   }
   return {build};
 })();

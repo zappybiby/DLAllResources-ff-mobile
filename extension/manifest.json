@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Export ZIP",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Save the open page, its current form state, and its source assets for offline inspection.",
   "permissions": ["activeTab", "http://*/*", "https://*/*"],
   "browser_action": {
